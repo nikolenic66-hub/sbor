@@ -58,6 +58,7 @@ def admin_keyboard(notification_issues: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=notice, callback_data="admin:notifications")],
         [InlineKeyboardButton(text="🗄️ Создать копию", callback_data="admin:backup:create"),
          InlineKeyboardButton(text="📚 Резервные копии", callback_data="admin:backup:list")],
+        [InlineKeyboardButton(text="🧹 Очистка старых заявок", callback_data="admin:retention:preview")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin:settings")],
     ])
 
@@ -143,6 +144,13 @@ def backup_list_keyboard(backups: list[dict]) -> InlineKeyboardMarkup:
     ))
     builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin:home"))
     return builder.as_markup()
+
+
+def retention_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Удалить старые закрытые заявки", callback_data="admin:retention:confirm")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin:home")],
+    ])
 
 
 def backup_confirm_keyboard(filename: str) -> InlineKeyboardMarkup:
