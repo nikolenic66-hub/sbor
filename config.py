@@ -93,6 +93,17 @@ def get_backup_retention() -> int:
     return value
 
 
+def get_lead_retention_days() -> int:
+    raw = os.getenv("LEAD_RETENTION_DAYS", "180").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("LEAD_RETENTION_DAYS должен быть целым числом от 30 до 3650.") from exc
+    if not 30 <= value <= 3650:
+        raise RuntimeError("LEAD_RETENTION_DAYS должен быть от 30 до 3650.")
+    return value
+
+
 def get_backup_interval_hours() -> int:
     raw = os.getenv("BACKUP_INTERVAL_HOURS", "24").strip()
     try:
