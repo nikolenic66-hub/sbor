@@ -1,0 +1,4 @@
+# Telegram polling bot: no inbound HTTP port is required.
+# Keep SQLite data and local backups on Amvera's persistent volume.
+run:
+  persistenceMount: /app/data
