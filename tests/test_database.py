@@ -127,5 +127,78 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await legacy_db.count_notification_issues(), 0)
 
 
+
+    async def test_backup_and_restore_keeps_a_pre_restore_snapshot(self) -> None:
+        original_id = await self.db.create_lead(sample_lead(1))
+        await self.db.set_setting("company_name", "До восстановления")
+        backup = await self.db.create_backup()
+
+        await self.db.create_lead(sample_lead(2))
+        await self.db.set_setting("company_name", "После создания копии")
+
+        result = await self.db.restore_backup(backup["filename"])
+        leads = await self.db.list_leads(limit=100)
+        self.assertEqual([lead["id"] for lead in leads], [original_id])
+        self.assertEqual(await self.db.get_setting("company_name"), "До восстановления")
+        self.assertEqual(result["restored_from"], backup["filename"])
+        self.assertNotEqual(result["pre_restore_backup"], backup["filename"])
+        self.assertTrue((self.db.backup_dir / result["pre_restore_backup"]).is_file())
+        self.assertIn(backup["filename"], [item["filename"] for item in await self.db.list_backups()])
+
+    async def test_import_backup_validates_before_adding_restore_point(self) -> None:
+        backup = await self.db.create_backup()
+        imported = await self.db.import_backup(Path(backup["path"]))
+        self.assertNotEqual(imported["filename"], backup["filename"])
+        self.assertTrue((self.db.backup_dir / imported["filename"]).is_file())
+
+        corrupt = Path(self.tempdir.name) / "not-a-database.sqlite3"
+        corrupt.write_text("not a SQLite database", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            await self.db.import_backup(corrupt)
+
+    async def test_backup_retention_keeps_configured_number(self) -> None:
+        self.db.backup_retention = 2
+        for _ in range(5):
+            await self.db.create_backup()
+        backups = await self.db.list_backups()
+        self.assertEqual(len(backups), 2)
+
+    async def test_restore_rejects_path_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.db.restore_backup("../private.sqlite3")
+
+    async def test_restore_migrates_older_backup_schema(self) -> None:
+        old_path = Path(self.tempdir.name) / "legacy.sqlite3"
+        with sqlite3.connect(old_path) as legacy:
+            legacy.executescript("""
+                CREATE TABLE leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL,
+                    service TEXT NOT NULL,
+                    contact TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    budget TEXT NOT NULL DEFAULT '',
+                    deadline TEXT NOT NULL DEFAULT '',
+                    custom_answers TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'new',
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+                    updated_at TEXT
+                );
+                CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO leads (user_id, full_name, service, contact, description)
+                VALUES (77, 'Старый клиент', 'Тест', '@old', 'Заявка из старой базы');
+                INSERT INTO settings(key, value) VALUES ('company_name', '"Старый бренд"');
+            """)
+        imported = await self.db.import_backup(old_path)
+        result = await self.db.restore_backup(imported["filename"])
+        lead = await self.db.get_lead(1)
+        self.assertIsNotNone(lead)
+        self.assertEqual(lead["full_name"], "Старый клиент")
+        self.assertEqual(lead["notification_status"], "unknown")
+        self.assertEqual(await self.db.get_setting("company_name"), "Старый бренд")
+        self.assertEqual(result["lead_count"], 1)
+
 if __name__ == "__main__":
     unittest.main()
