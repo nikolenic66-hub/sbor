@@ -23,7 +23,7 @@ from config import (
     get_backup_retention, get_bot_token, get_database_path, get_lead_retention_days, load_defaults,
 )
 from database import Database
-from safety import is_private_admin, safe_csv_cell
+from safety import is_private_admin, is_private_chat, safe_csv_cell
 from keyboards import (
     BTN_ADMIN, BTN_CONTACTS, BTN_NEW_LEAD, BTN_SERVICES, admin_keyboard,
     admin_settings_keyboard, backup_confirm_keyboard, backup_list_keyboard, retention_confirm_keyboard,
@@ -110,6 +110,11 @@ def private_admin_message(message: Message) -> bool:
         message.chat.type,
         ADMIN_IDS,
     )
+
+
+def private_client_callback(callback: CallbackQuery) -> bool:
+    chat = getattr(callback.message, "chat", None) if callback.message is not None else None
+    return is_private_chat(getattr(chat, "type", None))
 
 
 async def require_admin_callback(callback: CallbackQuery) -> bool:
@@ -282,6 +287,12 @@ async def render_lead(callback: CallbackQuery, lead_id: int, back_to: str) -> No
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if not is_private_chat(message.chat.type):
+        await message.answer(
+            "Чтобы не раскрывать личные данные в группе, откройте личный чат с ботом "
+            "и отправьте /start."
+        )
+        return
     company = escape_text(await setting("company_name", "Заявки компании"))
     welcome = escape_text(await setting("welcome_text", "Оставьте заявку через меню."))
     privacy = escape_text(await setting("privacy_notice", ""))
@@ -313,6 +324,11 @@ async def admin_home(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == BTN_NEW_LEAD)
 async def new_lead(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message.chat.type):
+        await message.answer(
+            "Заявку можно оформить только в личном чате с ботом — так ваши контакты не увидят участники группы."
+        )
+        return
     await show_service_picker(message, state)
 
 
@@ -335,6 +351,9 @@ async def contacts(message: Message) -> None:
 
 @router.callback_query(F.data == "lead:cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not private_client_callback(callback):
+        await callback.answer("Оформление заявки доступно только в личном чате с ботом.", show_alert=True)
+        return
     await state.clear()
     await callback.answer("Заявка отменена")
     await callback.message.answer("Заявка отменена. При необходимости можно начать заново.", reply_markup=main_menu(is_admin(callback.from_user.id)))
@@ -342,6 +361,9 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("lead:service:"))
 async def choose_service(callback: CallbackQuery, state: FSMContext) -> None:
+    if not private_client_callback(callback):
+        await callback.answer("Оформление заявки доступно только в личном чате с ботом.", show_alert=True)
+        return
     try:
         index = int(callback.data.rsplit(":", 1)[1])
     except (ValueError, AttributeError):
@@ -419,6 +441,9 @@ async def receive_deadline(message: Message, state: FSMContext, bot: Bot) -> Non
 
 @router.callback_query(F.data.startswith("lead:skip:"))
 async def skip_field(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not private_client_callback(callback):
+        await callback.answer("Оформление заявки доступно только в личном чате с ботом.", show_alert=True)
+        return
     field_name = callback.data.rsplit(":", 1)[1]
     current = await state.get_state()
     if field_name == "budget" and current == LeadForm.budget.state:

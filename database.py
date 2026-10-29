@@ -552,13 +552,37 @@ class Database:
 
     async def delete_old_closed_leads(self, retention_days: int) -> dict[str, Any]:
         cutoff = self._old_closed_lead_cutoff(retention_days)
+
         def operation() -> dict[str, Any]:
+            # Snapshot all records eligible for deletion before destructive cleanup.
+            with self._connection() as db:
+                row = db.execute(
+                    "SELECT COUNT(*) AS total FROM leads "
+                    "WHERE status IN ('completed', 'cancelled') AND created_at < ?",
+                    (cutoff,),
+                ).fetchone()
+                eligible = int(row["total"] if row else 0)
+
+            backup_before_delete: str | None = None
+            if eligible:
+                backup = self._create_backup_sync(prune=False)
+                backup_before_delete = str(backup["filename"])
+
             with self._connection() as db:
                 cursor = db.execute(
                     "DELETE FROM leads WHERE status IN ('completed', 'cancelled') AND created_at < ?",
                     (cutoff,),
                 )
-                return {"deleted": int(cursor.rowcount), "cutoff": cutoff}
+                deleted = int(cursor.rowcount)
+
+            if backup_before_delete:
+                self._prune_backups_sync(protected={backup_before_delete})
+            return {
+                "deleted": deleted,
+                "cutoff": cutoff,
+                "backup_before_delete": backup_before_delete,
+            }
+
         return await self._run(operation)
 
     async def get_stats(self) -> dict[str, int]:

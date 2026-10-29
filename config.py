@@ -35,6 +35,9 @@ def load_defaults() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Не удалось прочитать config.json: {exc}") from exc
 
+    if not isinstance(defaults, dict):
+        raise RuntimeError("config.json должен содержать JSON-объект с настройками.")
+
     env_overrides = {
         "company_name": os.getenv("COMPANY_NAME"),
         "welcome_text": os.getenv("WELCOME_TEXT"),
@@ -47,7 +50,14 @@ def load_defaults() -> dict[str, Any]:
 
 
 def get_bot_token() -> str:
-    return os.getenv("BOT_TOKEN", "").strip()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    placeholder_markers = ("YOUR_TELEGRAM", "TOKEN_HERE", "PLACEHOLDER", "CHANGE_ME", "REPLACE_ME")
+    if not token or any(marker in token.upper() for marker in placeholder_markers):
+        raise RuntimeError(
+            "BOT_TOKEN не задан: укажите настоящий токен, полученный у @BotFather, "
+            "в секретах хостинга или в локальном .env."
+        )
+    return token
 
 
 def get_admin_ids() -> set[int]:
@@ -58,14 +68,17 @@ def get_admin_ids() -> set[int]:
         if not item:
             continue
         try:
-            result.add(int(item))
+            user_id = int(item)
         except ValueError as exc:
             raise RuntimeError(f"ADMIN_IDS содержит нечисловой Telegram ID: {item!r}") from exc
+        if user_id <= 0:
+            raise RuntimeError(f"ADMIN_IDS должен содержать только положительные Telegram user ID: {item!r}")
+        result.add(user_id)
     return result
 
 
 def get_database_path() -> Path:
-    raw = os.getenv("DATABASE_PATH", "data/sbor.sqlite3").strip()
+    raw = os.getenv("DATABASE_PATH", "").strip() or "data/sbor.sqlite3"
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = BASE_DIR / path

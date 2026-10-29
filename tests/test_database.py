@@ -54,6 +54,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.count_old_closed_leads(180), 2)
         result = await self.db.delete_old_closed_leads(180)
         self.assertEqual(result["deleted"], 2)
+        self.assertIsNotNone(result["backup_before_delete"])
+        snapshot = Database._validate_backup_file(
+            self.db.backup_dir / result["backup_before_delete"]
+        )
+        self.assertEqual(snapshot["lead_count"], 5)
         self.assertIsNone(await self.db.get_lead(old_completed))
         self.assertIsNone(await self.db.get_lead(old_cancelled))
         self.assertIsNotNone(await self.db.get_lead(old_new))
