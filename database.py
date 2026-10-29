@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
+LEAD_STATUSES = {"new", "in_progress", "completed", "cancelled"}
+NOTIFICATION_STATUSES = {"pending", "sent", "partial", "failed", "unknown"}
 
 
 class Database:
@@ -57,7 +59,11 @@ class Database:
                         custom_answers TEXT NOT NULL DEFAULT '{}',
                         status TEXT NOT NULL DEFAULT 'new',
                         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
-                        updated_at TEXT
+                        updated_at TEXT,
+                        notification_status TEXT NOT NULL DEFAULT 'pending',
+                        notification_delivered_admins TEXT NOT NULL DEFAULT '[]',
+                        notification_failed_admins TEXT NOT NULL DEFAULT '[]',
+                        notification_error TEXT NOT NULL DEFAULT ''
                     );
                     CREATE INDEX IF NOT EXISTS idx_leads_status_id ON leads(status, id DESC);
                     CREATE TABLE IF NOT EXISTS settings (
@@ -66,6 +72,23 @@ class Database:
                     );
                     """
                 )
+
+                # Forward-compatible migration for databases created by the first MVP.
+                existing = {row["name"] for row in db.execute("PRAGMA table_info(leads)").fetchall()}
+                migrations = {
+                    "notification_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                    "notification_delivered_admins": "TEXT NOT NULL DEFAULT '[]'",
+                    "notification_failed_admins": "TEXT NOT NULL DEFAULT '[]'",
+                    "notification_error": "TEXT NOT NULL DEFAULT ''",
+                }
+                for column, definition in migrations.items():
+                    if column not in existing:
+                        db.execute(f"ALTER TABLE leads ADD COLUMN {column} {definition}")
+                db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_leads_notification_status "
+                    "ON leads(notification_status, id DESC)"
+                )
+
                 for key, value in defaults.items():
                     db.execute(
                         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
@@ -87,6 +110,7 @@ class Database:
 
     async def set_setting(self, key: str, value: Any) -> None:
         packed = json.dumps(value, ensure_ascii=False)
+
         def operation() -> None:
             with self._connection() as db:
                 db.execute(
@@ -131,6 +155,9 @@ class Database:
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         offset = max(0, int(offset))
+        if status is not None and status not in LEAD_STATUSES:
+            raise ValueError("Недопустимый статус заявки")
+
         def operation() -> list[dict[str, Any]]:
             with self._connection() as db:
                 if status:
@@ -145,10 +172,53 @@ class Database:
             return [self._lead_dict(row) for row in rows]
         return await self._run(operation)
 
-    async def update_status(self, lead_id: int, status: str) -> bool:
-        allowed = {"new", "in_progress", "completed", "cancelled"}
-        if status not in allowed:
+    async def count_leads(self, status: str | None = None) -> int:
+        if status is not None and status not in LEAD_STATUSES:
             raise ValueError("Недопустимый статус заявки")
+
+        def operation() -> int:
+            with self._connection() as db:
+                if status:
+                    row = db.execute("SELECT COUNT(*) AS total FROM leads WHERE status = ?", (status,)).fetchone()
+                else:
+                    row = db.execute("SELECT COUNT(*) AS total FROM leads").fetchone()
+            return int(row["total"] if row else 0)
+        return await self._run(operation)
+
+    async def search_leads(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        query = str(query).strip()[:100]
+        limit = max(1, min(int(limit), 100))
+        if not query:
+            return []
+
+        def operation() -> list[dict[str, Any]]:
+            with self._connection() as db:
+                clean = query[1:] if query.startswith("#") else query
+                if clean.isdigit():
+                    rows = db.execute(
+                        "SELECT * FROM leads WHERE id = ? OR full_name LIKE ? ESCAPE '!' "
+                        "OR contact LIKE ? ESCAPE '!' ORDER BY id DESC LIMIT ?",
+                        (int(clean), self._like_pattern(query), self._like_pattern(query), limit),
+                    ).fetchall()
+                else:
+                    pattern = self._like_pattern(query)
+                    rows = db.execute(
+                        "SELECT * FROM leads WHERE full_name LIKE ? ESCAPE '!' "
+                        "OR contact LIKE ? ESCAPE '!' ORDER BY id DESC LIMIT ?",
+                        (pattern, pattern, limit),
+                    ).fetchall()
+            return [self._lead_dict(row) for row in rows]
+        return await self._run(operation)
+
+    @staticmethod
+    def _like_pattern(query: str) -> str:
+        escaped = query.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        return f"%{escaped}%"
+
+    async def update_status(self, lead_id: int, status: str) -> bool:
+        if status not in LEAD_STATUSES:
+            raise ValueError("Недопустимый статус заявки")
+
         def operation() -> bool:
             with self._connection() as db:
                 cursor = db.execute(
@@ -156,6 +226,57 @@ class Database:
                     (status, lead_id),
                 )
                 return cursor.rowcount > 0
+        return await self._run(operation)
+
+    async def update_notification_state(
+        self,
+        lead_id: int,
+        delivered_admins: list[int],
+        failed_admins: list[int],
+        status: str,
+        error: str = "",
+    ) -> bool:
+        if status not in NOTIFICATION_STATUSES:
+            raise ValueError("Недопустимый статус уведомления")
+        delivered = json.dumps(sorted({int(x) for x in delivered_admins}), ensure_ascii=False)
+        failed = json.dumps(sorted({int(x) for x in failed_admins}), ensure_ascii=False)
+
+        def operation() -> bool:
+            with self._connection() as db:
+                cursor = db.execute(
+                    """UPDATE leads
+                       SET notification_delivered_admins = ?,
+                           notification_failed_admins = ?,
+                           notification_status = ?,
+                           notification_error = ?
+                       WHERE id = ?""",
+                    (delivered, failed, status, str(error)[:500], lead_id),
+                )
+                return cursor.rowcount > 0
+        return await self._run(operation)
+
+    async def list_notification_issues(self, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+
+        def operation() -> list[dict[str, Any]]:
+            with self._connection() as db:
+                rows = db.execute(
+                    """SELECT * FROM leads
+                       WHERE notification_status IN ('pending', 'partial', 'failed')
+                       ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [self._lead_dict(row) for row in rows]
+        return await self._run(operation)
+
+    async def count_notification_issues(self) -> int:
+        def operation() -> int:
+            with self._connection() as db:
+                row = db.execute(
+                    "SELECT COUNT(*) AS total FROM leads "
+                    "WHERE notification_status IN ('pending', 'partial', 'failed')"
+                ).fetchone()
+            return int(row["total"] if row else 0)
         return await self._run(operation)
 
     async def get_stats(self) -> dict[str, int]:
@@ -181,8 +302,13 @@ class Database:
     @staticmethod
     def _lead_dict(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
-        try:
-            result["custom_answers"] = json.loads(result.get("custom_answers") or "{}")
-        except json.JSONDecodeError:
-            result["custom_answers"] = {}
+        for field, fallback in (
+            ("custom_answers", {}),
+            ("notification_failed_admins", []),
+            ("notification_delivered_admins", []),
+        ):
+            try:
+                result[field] = json.loads(result.get(field) or json.dumps(fallback))
+            except (TypeError, json.JSONDecodeError):
+                result[field] = fallback
         return result
