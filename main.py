@@ -4,7 +4,9 @@ import asyncio
 import csv
 import io
 import logging
+import secrets
 from html import escape
+from pathlib import PurePath
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -16,13 +18,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from config import get_admin_ids, get_bot_token, get_database_path, load_defaults
+from config import (
+    get_admin_ids, get_backup_directory, get_backup_interval_hours,
+    get_backup_retention, get_bot_token, get_database_path, load_defaults,
+)
 from database import Database
 from safety import is_private_admin, safe_csv_cell
 from keyboards import (
     BTN_ADMIN, BTN_CONTACTS, BTN_NEW_LEAD, BTN_SERVICES, admin_keyboard,
-    admin_settings_keyboard, lead_actions_keyboard, lead_list_keyboard,
-    main_menu, service_keyboard, skip_keyboard,
+    admin_settings_keyboard, backup_confirm_keyboard, backup_list_keyboard,
+    lead_actions_keyboard, lead_list_keyboard, main_menu, service_keyboard, skip_keyboard,
 )
 
 logging.basicConfig(
@@ -50,8 +55,15 @@ class AdminSearchFlow(StatesGroup):
     waiting_query = State()
 
 
+class BackupUploadFlow(StatesGroup):
+    waiting_file = State()
+
+
 DB: Database
 ADMIN_IDS: set[int]
+BACKUP_INTERVAL_HOURS: int
+MAX_BACKUP_UPLOAD_BYTES = 19 * 1024 * 1024
+MAX_BACKUP_TELEGRAM_BYTES = 45 * 1024 * 1024
 
 STATUS_LABELS = {
     "new": "Новая",
@@ -624,6 +636,199 @@ async def admin_notify_retry(callback: CallbackQuery, bot: Bot) -> None:
         )
 
 
+@router.callback_query(F.data == "admin:backup:create")
+async def admin_backup_create(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await callback.answer("Создаю резервную копию…")
+    try:
+        backup = await DB.create_backup()
+    except Exception:
+        log.exception("Не удалось создать резервную копию базы")
+        await callback.message.answer(
+            "❌ Не удалось создать резервную копию. Проверьте доступность постоянного диска хостинга."
+        )
+        return
+
+    size = int(backup["size_bytes"])
+    size_text = f"{size / (1024 * 1024):.2f} МБ" if size >= 1024 * 1024 else f"{max(1, size // 1024)} КБ"
+    if size > MAX_BACKUP_TELEGRAM_BYTES:
+        await callback.message.answer(
+            f"✅ Копия создана на сервере: <code>{escape_text(backup['filename'])}</code> ({size_text}).\n"
+            "Файл слишком большой для безопасной отправки через этот бот. Для защиты от потери всего хранилища "
+            "нужна отдельная выгрузка файла из хранилища хостинга."
+        )
+        return
+
+    try:
+        path = DB.backup_dir / backup["filename"]
+        document = BufferedInputFile(path.read_bytes(), filename=backup["filename"])
+        await bot.send_document(
+            callback.from_user.id,
+            document,
+            caption=(
+                "✅ Резервная копия базы создана.\n"
+                f"Файл: {escape_text(backup['filename'])}\n"
+                f"Размер: {size_text}\n\n"
+                "Скачайте этот файл на устройство или в другое надёжное хранилище. "
+                "Локальная копия на том же хостинге не защищает от потери всего диска."
+            ),
+        )
+    except (OSError, TelegramAPIError):
+        log.exception("Резервная копия создана, но не удалось отправить её администратору")
+        await callback.message.answer(
+            f"✅ Копия сохранена на сервере ({size_text}), но отправить файл в Telegram не удалось. "
+            "Откройте список резервных копий и проверьте доступность файла."
+        )
+
+
+@router.callback_query(F.data == "admin:backup:list")
+async def admin_backup_list(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    backups = await DB.list_backups()
+    if not backups:
+        text = (
+            "<b>Резервные копии</b>\n\n"
+            "Пока нет ни одной корректной копии. Создайте её кнопкой в админ-панели "
+            "или загрузите файл резервной копии с устройства."
+        )
+    else:
+        text = (
+            f"<b>Резервные копии: {len(backups)}</b>\n\n"
+            "Выберите копию для восстановления. Перед восстановлением текущая база автоматически сохраняется "
+            "в отдельную резервную копию. Для восстановления после потери хостинга загрузите копию с устройства."
+        )
+    await callback.message.edit_text(text, reply_markup=backup_list_keyboard(backups))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:backup:restore:"))
+async def admin_backup_restore_preview(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    filename = callback.data.split(":", 3)[3]
+    backups = await DB.list_backups()
+    selected = next((item for item in backups if item["filename"] == filename), None)
+    if selected is None:
+        await callback.answer("Эта копия не найдена или не прошла проверку целостности.", show_alert=True)
+        return
+    size = int(selected["size_bytes"])
+    size_text = f"{size / (1024 * 1024):.2f} МБ" if size >= 1024 * 1024 else f"{max(1, size // 1024)} КБ"
+    await callback.message.edit_text(
+        "⚠️ <b>Подтвердите восстановление базы</b>\n\n"
+        f"Копия: <code>{escape_text(filename)}</code>\n"
+        f"Создана: {escape_text(selected['created_at'])}\n"
+        f"Размер: {size_text}\n\n"
+        "Текущая база будет сохранена перед восстановлением. "
+        "Заявки и настройки, появившиеся после выбранной копии, исчезнут из активной базы. "
+        "Продолжайте только если выбрана правильная дата.",
+        reply_markup=backup_confirm_keyboard(filename),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:backup:confirm:"))
+async def admin_backup_restore_confirm(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    filename = callback.data.split(":", 3)[3]
+    await callback.answer("Проверяю копию и восстанавливаю базу…")
+    try:
+        result = await DB.restore_backup(filename)
+    except (ValueError, OSError) as exc:
+        await callback.message.answer(f"❌ Восстановление не выполнено: {escape_text(exc, 350)}")
+        return
+    except Exception:
+        log.exception("Ошибка восстановления резервной копии %s", filename)
+        await callback.message.answer(
+            "❌ Восстановление не завершилось. Текущая база предварительно сохранена; "
+            "проверьте журнал и используйте созданную перед восстановлением копию."
+        )
+        return
+
+    await callback.message.edit_text(
+        "✅ <b>База восстановлена</b>\n\n"
+        f"Источник: <code>{escape_text(result['restored_from'])}</code>\n"
+        f"Заявок в восстановленной копии: <b>{result['lead_count']}</b>\n"
+        f"Настроек: <b>{result['setting_count']}</b>\n\n"
+        "Текущее состояние перед восстановлением сохранено в копию:\n"
+        f"<code>{escape_text(result['pre_restore_backup'])}</code>",
+        reply_markup=await admin_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:backup:upload")
+async def admin_backup_upload_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await state.set_state(BackupUploadFlow.waiting_file)
+    await callback.message.answer(
+        "📥 <b>Загрузка резервной копии</b>\n\n"
+        "Прикрепите SQLite-файл с расширением <code>.sqlite3</code>, <code>.sqlite</code> или <code>.db</code>. "
+        "Максимальный размер — 19 МБ.\n"
+        "Файл будет проверен на целостность и структуру; активная база не изменится до подтверждения восстановления.\n"
+        "Для отмены отправьте /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(BackupUploadFlow.waiting_file, F.document)
+async def admin_backup_upload_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not private_admin_message(message):
+        await state.clear()
+        await message.answer("Загрузка копий доступна только администратору в личном чате с ботом.")
+        return
+    document = message.document
+    suffix = PurePath(document.file_name or "").suffix.lower()
+    if suffix not in {".sqlite3", ".sqlite", ".db"}:
+        await message.answer("Неизвестный формат. Пришлите файл .sqlite3, .sqlite или .db.")
+        return
+    if document.file_size is None or document.file_size < 1 or document.file_size > MAX_BACKUP_UPLOAD_BYTES:
+        await message.answer("Размер файла должен быть от 1 байта до 19 МБ.")
+        return
+
+    DB.backup_dir.mkdir(parents=True, exist_ok=True)
+    temporary = DB.backup_dir / f".upload_{secrets.token_hex(8)}.tmp"
+    try:
+        await bot.download(document.file_id, destination=temporary)
+        backup = await DB.import_backup(temporary)
+    except (ValueError, OSError, TelegramAPIError) as exc:
+        log.warning("Отклонён загруженный файл резервной копии", exc_info=True)
+        await message.answer(
+            f"❌ Файл не принят: {escape_text(exc, 300)}\n"
+            "Проверьте, что это целый файл базы данных Sbor, а не CSV или архив."
+        )
+        return
+    except Exception:
+        log.exception("Не удалось загрузить или проверить файл резервной копии")
+        await message.answer(
+            "❌ Не удалось проверить файл. Активная база не изменена. "
+            "Попробуйте отправить другую копию."
+        )
+        return
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Резервная копия проверена и сохранена.</b>\n\n"
+        f"Файл: <code>{escape_text(backup['filename'])}</code>\n"
+        "Активная база пока не изменена. Для восстановления нажмите кнопку ниже и подтвердите действие.",
+        reply_markup=backup_confirm_keyboard(backup["filename"]),
+    )
+
+
+@router.message(BackupUploadFlow.waiting_file)
+async def admin_backup_upload_invalid(message: Message) -> None:
+    if not private_admin_message(message):
+        return
+    await message.answer("Пришлите файл резервной копии как документ или отправьте /cancel для отмены.")
+
+
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery) -> None:
     if not await require_admin_callback(callback):
@@ -744,8 +949,20 @@ async def admin_setting_save(message: Message, state: FSMContext) -> None:
     await message.answer("Параметры применены.", reply_markup=await admin_menu_keyboard())
 
 
+async def periodic_backup_worker() -> None:
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 60 * 60)
+        try:
+            backup = await DB.create_backup()
+            log.info("Создана плановая резервная копия %s", backup['filename'])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Не удалось создать плановую резервную копию")
+
+
 async def main() -> None:
-    global DB, ADMIN_IDS
+    global DB, ADMIN_IDS, BACKUP_INTERVAL_HOURS
     token = get_bot_token()
     ADMIN_IDS = get_admin_ids()
     if not token:
@@ -753,16 +970,32 @@ async def main() -> None:
     if not ADMIN_IDS:
         raise RuntimeError("Не заданы ADMIN_IDS. Укажите Telegram ID хотя бы одного администратора.")
 
-    DB = Database(get_database_path())
+    database_path = get_database_path()
+    BACKUP_INTERVAL_HOURS = get_backup_interval_hours()
+    DB = Database(database_path, get_backup_directory(), get_backup_retention())
     await DB.initialize(load_defaults())
+    try:
+        initial_backup = await DB.create_backup()
+        log.info("Создана стартовая резервная копия %s", initial_backup['filename'])
+    except Exception:
+        log.exception("Не удалось создать стартовую резервную копию; бот продолжит работу")
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
-    log.info("Бот запускается; администраторов: %d; SQLite: %s", len(ADMIN_IDS), get_database_path())
+    log.info(
+        "Бот запускается; администраторов: %d; SQLite: %s; backups: %s; retention: %d; interval: %dh",
+        len(ADMIN_IDS), database_path, DB.backup_dir, DB.backup_retention, BACKUP_INTERVAL_HOURS,
+    )
+    backup_task = asyncio.create_task(periodic_backup_worker(), name="sbor-periodic-backup")
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
 
 

@@ -56,6 +56,8 @@ def admin_keyboard(notification_issues: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
          InlineKeyboardButton(text="📤 Экспорт CSV", callback_data="admin:export")],
         [InlineKeyboardButton(text=notice, callback_data="admin:notifications")],
+        [InlineKeyboardButton(text="🗄️ Создать копию", callback_data="admin:backup:create"),
+         InlineKeyboardButton(text="📚 Резервные копии", callback_data="admin:backup:list")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin:settings")],
     ])
 
@@ -117,4 +119,37 @@ def lead_actions_keyboard(lead_id: int, back_to: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Выполнена", callback_data=f"admin:status:{lead_id}:completed"),
          InlineKeyboardButton(text="🚫 Отменена", callback_data=f"admin:status:{lead_id}:cancelled")],
         [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=f"admin:leads:{status}:0")],
+    ])
+
+
+
+def backup_list_keyboard(backups: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for backup in backups[:10]:
+        size = int(backup.get("size_bytes", 0))
+        if size >= 1024 * 1024:
+            size_label = f"{size / (1024 * 1024):.1f} МБ"
+        else:
+            size_label = f"{max(1, size // 1024)} КБ"
+        created = str(backup.get("created_at", backup["filename"]))[:20]
+        builder.button(
+            text=f"{created} · {size_label}"[:60],
+            callback_data=f"admin:backup:restore:{backup['filename']}",
+        )
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(
+        text="📥 Загрузить копию с устройства",
+        callback_data="admin:backup:upload",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin:home"))
+    return builder.as_markup()
+
+
+def backup_confirm_keyboard(filename: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="⚠️ Да, восстановить эту копию",
+            callback_data=f"admin:backup:confirm:{filename}",
+        )],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin:backup:list")],
     ])

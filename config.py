@@ -70,3 +70,35 @@ def get_database_path() -> Path:
     if not path.is_absolute():
         path = BASE_DIR / path
     return path
+
+
+def get_backup_directory() -> Path:
+    raw = os.getenv("BACKUP_DIRECTORY", "").strip()
+    if not raw:
+        return get_database_path().parent / "backups"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+def get_backup_retention() -> int:
+    raw = os.getenv("BACKUP_RETENTION", "10").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("BACKUP_RETENTION должен быть целым числом от 1 до 100.") from exc
+    if not 1 <= value <= 100:
+        raise RuntimeError("BACKUP_RETENTION должен быть от 1 до 100.")
+    return value
+
+
+def get_backup_interval_hours() -> int:
+    raw = os.getenv("BACKUP_INTERVAL_HOURS", "24").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("BACKUP_INTERVAL_HOURS должен быть целым числом от 1 до 168.") from exc
+    if not 1 <= value <= 168:
+        raise RuntimeError("BACKUP_INTERVAL_HOURS должен быть от 1 до 168.")
+    return value
