@@ -18,6 +18,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from config import get_admin_ids, get_bot_token, get_database_path, load_defaults
 from database import Database
+from safety import is_private_admin, safe_csv_cell
 from keyboards import (
     BTN_ADMIN, BTN_CONTACTS, BTN_NEW_LEAD, BTN_SERVICES, admin_keyboard,
     admin_settings_keyboard, lead_actions_keyboard, lead_list_keyboard,
@@ -45,6 +46,10 @@ class AdminSettingsFlow(StatesGroup):
     waiting_value = State()
 
 
+class AdminSearchFlow(StatesGroup):
+    waiting_query = State()
+
+
 DB: Database
 ADMIN_IDS: set[int]
 
@@ -53,6 +58,13 @@ STATUS_LABELS = {
     "in_progress": "В работе",
     "completed": "Выполнена",
     "cancelled": "Отменена",
+}
+NOTIFICATION_LABELS = {
+    "pending": "ещё не проверено",
+    "sent": "доставлено всем администраторам",
+    "partial": "доставлено не всем администраторам",
+    "failed": "не доставлено ни одному администратору",
+    "unknown": "статус неизвестен (старая заявка)",
 }
 SETTING_LABELS = {
     "company_name": "название компании",
@@ -79,7 +91,31 @@ def escape_text(value: Any, max_length: int | None = None) -> str:
     return escape(raw)
 
 
-def format_lead(lead: dict[str, Any]) -> str:
+def private_admin_message(message: Message) -> bool:
+    return is_private_admin(
+        message.from_user.id if message.from_user else None,
+        message.chat.type,
+        ADMIN_IDS,
+    )
+
+
+async def require_admin_callback(callback: CallbackQuery) -> bool:
+    chat = getattr(callback.message, "chat", None) if callback.message is not None else None
+    chat_type = getattr(chat, "type", None)
+    if is_private_admin(callback.from_user.id, chat_type, ADMIN_IDS):
+        return True
+    await callback.answer(
+        "Админ-панель доступна только администратору в личном чате с ботом.",
+        show_alert=True,
+    )
+    return False
+
+
+async def admin_menu_keyboard():
+    return admin_keyboard(await DB.count_notification_issues())
+
+
+def format_lead(lead: dict[str, Any], *, show_notification_status: bool = True) -> str:
     # Telegram limits messages to 4096 characters. Keep the admin view bounded;
     # full original text remains available in the CSV export.
     username = f"@{lead['username']}" if lead.get("username") else "не указан"
@@ -103,25 +139,64 @@ def format_lead(lead: dict[str, Any]) -> str:
         f"<b>Описание:</b> {escape_text(lead['description'], 250)}\n"
         f"<b>Бюджет:</b> {escape_text(lead['budget'] or 'не указан', 25)}\n"
         f"<b>Срок:</b> {escape_text(lead['deadline'] or 'не указан', 25)}"
-        f"{answer_text}"
+        + (f"\n<b>Уведомления:</b> {NOTIFICATION_LABELS.get(lead.get('notification_status', 'unknown'), 'неизвестно')}" if show_notification_status else "")
+        + f"{answer_text}"
     )
 
 
-async def send_admin_notification(bot: Bot, lead: dict[str, Any]) -> None:
-    text = format_lead(lead)
+async def send_admin_notification(
+    bot: Bot, lead: dict[str, Any], *, retry_failed: bool = False
+) -> str:
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    delivered = set(int(x) for x in lead.get("notification_delivered_admins", []))
+    previous_failed = set(int(x) for x in lead.get("notification_failed_admins", []))
+    recipients = (
+        previous_failed
+        if retry_failed and previous_failed
+        else (set(ADMIN_IDS) if not retry_failed or lead.get("notification_status") == "pending" else set())
+    )
+    if not recipients:
+        return str(lead.get("notification_status", "unknown"))
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Открыть заявку #{lead['id']}", callback_data=f"admin:view:{lead['id']}:new")]
     ])
-    sent = 0
-    for admin_id in ADMIN_IDS:
+    failed = set(previous_failed if retry_failed else ())
+    errors: list[str] = []
+    for admin_id in sorted(recipients):
         try:
-            await bot.send_message(admin_id, f"🆕 <b>Новая заявка</b>\n\n{text}", reply_markup=keyboard)
-            sent += 1
-        except TelegramAPIError:
-            log.warning("Не удалось отправить уведомление администратору %s", admin_id)
-    if not sent:
-        log.error("Заявка #%s сохранена, но уведомления не доставлены ни одному администратору", lead["id"])
+            await bot.send_message(
+                admin_id,
+                f"🆕 <b>Новая заявка</b>\n\n{format_lead(lead, show_notification_status=False)}",
+                reply_markup=keyboard,
+            )
+            delivered.add(admin_id)
+            failed.discard(admin_id)
+        except TelegramAPIError as exc:
+            failed.add(admin_id)
+            errors.append(f"{admin_id}: {type(exc).__name__}")
+            log.warning(
+                "Не удалось отправить уведомление о заявке #%s администратору %s (%s)",
+                lead["id"], admin_id, type(exc).__name__,
+            )
+
+    if not failed:
+        status = "sent"
+    elif delivered:
+        status = "partial"
+    else:
+        status = "failed"
+
+    await DB.update_notification_state(
+        int(lead["id"]), sorted(delivered), sorted(failed), status, "; ".join(errors)
+    )
+    if failed:
+        log.error(
+            "Для заявки #%s остались недоставленные уведомления: %s",
+            lead["id"], sorted(failed),
+        )
+    return status
 
 
 async def show_service_picker(message: Message, state: FSMContext) -> None:
@@ -151,7 +226,7 @@ async def ask_custom_question_or_finish(message: Message, state: FSMContext, bot
     await state.update_data(custom_questions=questions, custom_answers={}, custom_index=0)
     if questions:
         await state.set_state(LeadForm.custom_answer)
-        await message.answer(f"{questions[0]}\n\n<i>Вопрос 1 из {len(questions)}. Для отмены отправьте /cancel.</i>")
+        await message.answer(f"{escape_text(questions[0], 300)}\n\n<i>Вопрос 1 из {len(questions)}. Для отмены отправьте /cancel.</i>")
         return
     await finalize_lead(message, state, bot)
 
@@ -212,12 +287,15 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @router.message(Command("admin"))
 @router.message(F.text == BTN_ADMIN)
 async def admin_home(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
-        await message.answer("У вас нет доступа к админ-панели.")
+    if not private_admin_message(message):
+        await message.answer("Админ-панель доступна только администратору в личном чате с ботом.")
         return
     await state.clear()
     company = escape_text(await setting("company_name", "Компания"))
-    await message.answer(f"<b>Админ-панель · {company}</b>\nВыберите действие:", reply_markup=admin_keyboard())
+    await message.answer(
+        f"<b>Админ-панель · {company}</b>\nВыберите действие:",
+        reply_markup=await admin_menu_keyboard(),
+    )
 
 
 @router.message(F.text == BTN_NEW_LEAD)
@@ -362,51 +440,77 @@ async def receive_custom_answer(message: Message, state: FSMContext, bot: Bot) -
     index += 1
     await state.update_data(custom_answers=answers, custom_index=index)
     if index < len(questions):
-        await message.answer(f"{questions[index]}\n\n<i>Вопрос {index + 1} из {len(questions)}. Для отмены отправьте /cancel.</i>")
+        await message.answer(f"{escape_text(questions[index], 300)}\n\n<i>Вопрос {index + 1} из {len(questions)}. Для отмены отправьте /cancel.</i>")
         return
     await finalize_lead(message, state, bot)
 
 
 @router.callback_query(F.data == "admin:home")
 async def admin_home_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     await state.clear()
     company = escape_text(await setting("company_name", "Компания"))
-    await callback.message.edit_text(f"<b>Админ-панель · {company}</b>\nВыберите действие:", reply_markup=admin_keyboard())
+    await callback.message.edit_text(
+        f"<b>Админ-панель · {company}</b>\nВыберите действие:",
+        reply_markup=await admin_menu_keyboard(),
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:leads:"))
 async def admin_list_leads(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
-    filter_value = callback.data.rsplit(":", 1)[1]
-    if filter_value not in {"new", "all"}:
+    parts = callback.data.split(":")
+    filter_value = parts[2] if len(parts) > 2 else ""
+    try:
+        offset = max(0, int(parts[3])) if len(parts) > 3 else 0
+    except ValueError:
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+    titles = {
+        "all": "Все заявки",
+        "new": "Новые заявки",
+        "in_progress": "Заявки в работе",
+        "completed": "Выполненные заявки",
+        "cancelled": "Отменённые заявки",
+    }
+    if filter_value not in titles:
         await callback.answer("Неизвестный фильтр", show_alert=True)
         return
-    status = "new" if filter_value == "new" else None
-    items = await DB.list_leads(status=status, limit=10)
-    caption = "<b>Новые заявки</b>" if filter_value == "new" else "<b>Последние заявки</b>"
+    status = None if filter_value == "all" else filter_value
+    total = await DB.count_leads(status)
+    if offset >= total and offset > 0:
+        offset = max(0, ((total - 1) // 10) * 10) if total else 0
+    items = await DB.list_leads(status=status, limit=10, offset=offset)
+    caption = f"<b>{escape_text(titles[filter_value])}</b>"
     if not items:
-        await callback.message.edit_text(caption + "\n\nЗаявок пока нет.", reply_markup=admin_keyboard())
+        await callback.message.edit_text(
+            caption + "\n\nЗаявок пока нет.",
+            reply_markup=await admin_menu_keyboard(),
+        )
     else:
-        caption += f"\nПоказаны последние {len(items)} заявок. Нажмите на заявку для подробностей:"
-        await callback.message.edit_text(caption, reply_markup=lead_list_keyboard(items, filter_value))
+        caption += f"\nПоказаны {offset + 1}–{offset + len(items)} из {total}. Нажмите на заявку:"
+        await callback.message.edit_text(
+            caption,
+            reply_markup=lead_list_keyboard(
+                items, filter_value, offset,
+                has_prev=offset > 0,
+                has_next=(offset + len(items)) < total,
+            ),
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:view:"))
 async def admin_view_lead(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     parts = callback.data.split(":")
     try:
         lead_id = int(parts[2])
-        back_to = parts[3] if len(parts) > 3 and parts[3] in {"new", "all"} else "all"
+        back_to = parts[3] if len(parts) > 3 and parts[3] in {"new", "all", "in_progress", "completed", "cancelled"} else "all"
     except (ValueError, IndexError):
         await callback.answer("Некорректный номер заявки", show_alert=True)
         return
@@ -415,8 +519,7 @@ async def admin_view_lead(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin:status:"))
 async def admin_update_status(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     parts = callback.data.split(":")
     try:
@@ -437,10 +540,93 @@ async def admin_update_status(callback: CallbackQuery) -> None:
         await callback.message.edit_text(format_lead(lead), reply_markup=lead_actions_keyboard(lead_id, "all"))
 
 
+@router.callback_query(F.data == "admin:search")
+async def admin_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await state.set_state(AdminSearchFlow.waiting_query)
+    await callback.message.answer(
+        "🔎 <b>Поиск заявок</b>\nОтправьте номер заявки (например, <code>#24</code>) "
+        "или часть имени/контакта клиента.\nДля отмены отправьте /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(AdminSearchFlow.waiting_query)
+async def admin_search_run(message: Message, state: FSMContext) -> None:
+    if not private_admin_message(message):
+        await state.clear()
+        await message.answer("Поиск доступен только администратору в личном чате с ботом.")
+        return
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Введите номер заявки, имя или контакт.")
+        return
+    if len(query) > 100:
+        await message.answer("Запрос слишком длинный. Максимум 100 символов.")
+        return
+    items = await DB.search_leads(query, limit=10)
+    await state.clear()
+    if not items:
+        await message.answer(
+            f"По запросу «{escape_text(query, 100)}» ничего не найдено.",
+            reply_markup=await admin_menu_keyboard(),
+        )
+        return
+    await message.answer(
+        f"🔎 <b>Результаты поиска</b>\nЗапрос: «{escape_text(query, 100)}». Показаны первые {len(items)} результатов.",
+        reply_markup=lead_list_keyboard(items, "all", 0, has_prev=False, has_next=False),
+    )
+
+
+@router.callback_query(F.data == "admin:notifications")
+async def admin_notifications(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    count = await DB.count_notification_issues()
+    issues = await DB.list_notification_issues(limit=10)
+    if not issues:
+        await callback.message.edit_text(
+            "✅ <b>Проблем с уведомлениями нет.</b>\n\n"
+            "Перед запуском проверьте, что каждый администратор открыл личный чат с ботом и отправил /start.",
+            reply_markup=await admin_menu_keyboard(),
+        )
+    else:
+        await callback.message.edit_text(
+            f"⚠️ <b>Проблемы доставки уведомлений: {count}</b>\n\n"
+            "Откройте заявку и повторите отправку. При повторе бот отправляет сообщение только администраторам, "
+            "которым не удалось доставить его ранее. Показаны последние 10 заявок.",
+            reply_markup=notification_list_keyboard(issues),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:notify-retry:"))
+async def admin_notify_retry(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin_callback(callback):
+        return
+    try:
+        lead_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный номер заявки", show_alert=True)
+        return
+    lead = await DB.get_lead(lead_id)
+    if not lead:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await callback.answer("Проверяю доставку…")
+    await send_admin_notification(bot, lead, retry_failed=True)
+    updated = await DB.get_lead(lead_id)
+    if updated:
+        await callback.message.edit_text(
+            format_lead(updated),
+            reply_markup=lead_actions_keyboard(lead_id, "all"),
+        )
+
+
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     stats = await DB.get_stats()
     await callback.message.edit_text(
@@ -449,16 +635,16 @@ async def admin_stats(callback: CallbackQuery) -> None:
         f"🆕 Новые: {stats['new']}\n"
         f"⏳ В работе: {stats['in_progress']}\n"
         f"✅ Выполнены: {stats['completed']}\n"
-        f"🚫 Отменены: {stats['cancelled']}",
-        reply_markup=admin_keyboard(),
+        f"🚫 Отменены: {stats['cancelled']}\n"
+        f"⚠️ Проблемы доставки уведомлений: <b>{await DB.count_notification_issues()}</b>",
+        reply_markup=await admin_menu_keyboard(),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:export")
 async def admin_export(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     leads = await DB.export_leads()
     if not leads:
@@ -471,6 +657,8 @@ async def admin_export(callback: CallbackQuery, bot: Bot) -> None:
     for lead in leads:
         row = dict(lead)
         row["custom_answers"] = " | ".join(f"{k}: {v}" for k, v in (row.get("custom_answers") or {}).items())
+        # Keep untrusted form values as text when opened in spreadsheet software.
+        row = {key: safe_csv_cell(value) for key, value in row.items()}
         writer.writerow(row)
     file = BufferedInputFile(output.getvalue().encode("utf-8-sig"), filename="sbor_leads.csv")
     await bot.send_document(callback.from_user.id, file, caption=f"Экспорт заявок: {len(leads)}")
@@ -479,8 +667,7 @@ async def admin_export(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     await callback.message.edit_text(
         "<b>Настройки бота</b>\nВыберите параметр. Услуги и вопросы задаются по одному на строку.",
@@ -491,8 +678,7 @@ async def admin_settings(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin:setting:"))
 async def admin_setting_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    if not await require_admin_callback(callback):
         return
     key = callback.data.split(":", 2)[2]
     if key not in SETTING_LABELS:
@@ -518,9 +704,9 @@ async def admin_setting_start(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(AdminSettingsFlow.waiting_value)
 async def admin_setting_save(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id if message.from_user else None):
+    if not private_admin_message(message):
         await state.clear()
-        await message.answer("У вас нет доступа к этой настройке.")
+        await message.answer("Настройки доступны только администратору в личном чате с ботом.")
         return
     value = (message.text or "").strip()
     if not value:
@@ -555,7 +741,7 @@ async def admin_setting_save(message: Message, state: FSMContext) -> None:
         f"✅ Сохранено: <b>{escape_text(SETTING_LABELS[key])}</b>.",
         reply_markup=main_menu(is_admin=True),
     )
-    await message.answer("Параметры применены.", reply_markup=admin_keyboard())
+    await message.answer("Параметры применены.", reply_markup=await admin_menu_keyboard())
 
 
 async def main() -> None:
