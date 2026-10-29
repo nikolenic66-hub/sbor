@@ -31,6 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("sbor")
 router = Router()
 
+
 class LeadForm(StatesGroup):
     name = State()
     contact = State()
@@ -71,29 +72,37 @@ async def setting(key: str, fallback: Any = None) -> Any:
     return await DB.get_setting(key, fallback)
 
 
-def escape_text(value: Any) -> str:
-    return escape(str(value if value is not None else "—"))
+def escape_text(value: Any, max_length: int | None = None) -> str:
+    raw = str(value if value is not None else "—")
+    if max_length is not None and len(raw) > max_length:
+        raw = raw[:max_length] + "…"
+    return escape(raw)
 
 
 def format_lead(lead: dict[str, Any]) -> str:
+    # Telegram limits messages to 4096 characters. Keep the admin view bounded;
+    # full original text remains available in the CSV export.
     username = f"@{lead['username']}" if lead.get("username") else "не указан"
     answers = lead.get("custom_answers") or {}
     answer_text = ""
     if answers:
         answer_text = "\n\n<b>Дополнительные ответы:</b>"
-        for question, answer in answers.items():
-            answer_text += f"\n• {escape_text(question)}: {escape_text(answer)}"
+        for index, (question, answer) in enumerate(answers.items()):
+            if index >= 2:
+                answer_text += "\n<i>Остальные ответы доступны в CSV.</i>"
+                break
+            answer_text += f"\n• {escape_text(question, 25)}: {escape_text(answer, 30)}"
     return (
         f"<b>Заявка #{lead['id']}</b>\n"
         f"<b>Статус:</b> {STATUS_LABELS.get(lead['status'], lead['status'])}\n"
-        f"<b>Создана:</b> {escape_text(lead['created_at'])}\n\n"
-        f"<b>Имя:</b> {escape_text(lead['full_name'])}\n"
-        f"<b>Telegram:</b> {escape_text(username)}\n"
-        f"<b>Услуга:</b> {escape_text(lead['service'])}\n"
-        f"<b>Контакт:</b> {escape_text(lead['contact'])}\n"
-        f"<b>Описание:</b> {escape_text(lead['description'])}\n"
-        f"<b>Бюджет:</b> {escape_text(lead['budget'] or 'не указан')}\n"
-        f"<b>Срок:</b> {escape_text(lead['deadline'] or 'не указан')}"
+        f"<b>Создана:</b> {escape_text(lead['created_at'], 25)}\n\n"
+        f"<b>Имя:</b> {escape_text(lead['full_name'], 35)}\n"
+        f"<b>Telegram:</b> {escape_text(username, 30)}\n"
+        f"<b>Услуга:</b> {escape_text(lead['service'], 30)}\n"
+        f"<b>Контакт:</b> {escape_text(lead['contact'], 40)}\n"
+        f"<b>Описание:</b> {escape_text(lead['description'], 250)}\n"
+        f"<b>Бюджет:</b> {escape_text(lead['budget'] or 'не указан', 25)}\n"
+        f"<b>Срок:</b> {escape_text(lead['deadline'] or 'не указан', 25)}"
         f"{answer_text}"
     )
 
