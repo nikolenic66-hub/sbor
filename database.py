@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -528,6 +528,37 @@ class Database:
                     "WHERE notification_status IN ('pending', 'partial', 'failed')"
                 ).fetchone()
             return int(row["total"] if row else 0)
+        return await self._run(operation)
+
+    @staticmethod
+    def _old_closed_lead_cutoff(retention_days: int) -> str:
+        days = int(retention_days)
+        if not 30 <= days <= 3650:
+            raise ValueError("Срок хранения должен быть от 30 до 3650 дней.")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        return cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+    async def count_old_closed_leads(self, retention_days: int) -> int:
+        cutoff = self._old_closed_lead_cutoff(retention_days)
+        def operation() -> int:
+            with self._connection() as db:
+                row = db.execute(
+                    "SELECT COUNT(*) AS total FROM leads "
+                    "WHERE status IN ('completed', 'cancelled') AND created_at < ?",
+                    (cutoff,),
+                ).fetchone()
+            return int(row["total"] if row else 0)
+        return await self._run(operation)
+
+    async def delete_old_closed_leads(self, retention_days: int) -> dict[str, Any]:
+        cutoff = self._old_closed_lead_cutoff(retention_days)
+        def operation() -> dict[str, Any]:
+            with self._connection() as db:
+                cursor = db.execute(
+                    "DELETE FROM leads WHERE status IN ('completed', 'cancelled') AND created_at < ?",
+                    (cutoff,),
+                )
+                return {"deleted": int(cursor.rowcount), "cutoff": cutoff}
         return await self._run(operation)
 
     async def get_stats(self) -> dict[str, int]:

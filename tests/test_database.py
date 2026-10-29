@@ -35,6 +35,37 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.tempdir.cleanup()
 
+    async def test_retention_deletes_only_old_closed_leads(self) -> None:
+        old_completed = await self.db.create_lead(sample_lead(10))
+        old_cancelled = await self.db.create_lead(sample_lead(11))
+        old_new = await self.db.create_lead(sample_lead(12))
+        old_in_progress = await self.db.create_lead(sample_lead(13))
+        recent_completed = await self.db.create_lead(sample_lead(14))
+        await self.db.update_status(old_completed, "completed")
+        await self.db.update_status(old_cancelled, "cancelled")
+        await self.db.update_status(old_in_progress, "in_progress")
+
+        with sqlite3.connect(self.db.path) as raw:
+            raw.execute(
+                "UPDATE leads SET created_at = '2020-01-01 00:00:00' WHERE id IN (?, ?, ?, ?)",
+                (old_completed, old_cancelled, old_new, old_in_progress),
+            )
+
+        self.assertEqual(await self.db.count_old_closed_leads(180), 2)
+        result = await self.db.delete_old_closed_leads(180)
+        self.assertEqual(result["deleted"], 2)
+        self.assertIsNone(await self.db.get_lead(old_completed))
+        self.assertIsNone(await self.db.get_lead(old_cancelled))
+        self.assertIsNotNone(await self.db.get_lead(old_new))
+        self.assertIsNotNone(await self.db.get_lead(old_in_progress))
+        self.assertIsNotNone(await self.db.get_lead(recent_completed))
+
+    async def test_retention_days_are_validated(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.db.count_old_closed_leads(10)
+        with self.assertRaises(ValueError):
+            await self.db.delete_old_closed_leads(5000)
+
     async def test_settings_can_be_updated(self) -> None:
         self.assertEqual(await self.db.get_setting("company_name"), "Тест")
         await self.db.set_setting("company_name", "Новое название")

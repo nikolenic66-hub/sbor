@@ -20,13 +20,13 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from config import (
     get_admin_ids, get_backup_directory, get_backup_interval_hours,
-    get_backup_retention, get_bot_token, get_database_path, load_defaults,
+    get_backup_retention, get_bot_token, get_database_path, get_lead_retention_days, load_defaults,
 )
 from database import Database
 from safety import is_private_admin, safe_csv_cell
 from keyboards import (
     BTN_ADMIN, BTN_CONTACTS, BTN_NEW_LEAD, BTN_SERVICES, admin_keyboard,
-    admin_settings_keyboard, backup_confirm_keyboard, backup_list_keyboard,
+    admin_settings_keyboard, backup_confirm_keyboard, backup_list_keyboard, retention_confirm_keyboard,
     lead_actions_keyboard, lead_list_keyboard, main_menu, service_keyboard, skip_keyboard,
 )
 
@@ -62,6 +62,7 @@ class BackupUploadFlow(StatesGroup):
 DB: Database
 ADMIN_IDS: set[int]
 BACKUP_INTERVAL_HOURS: int
+LEAD_RETENTION_DAYS: int
 MAX_BACKUP_UPLOAD_BYTES = 19 * 1024 * 1024
 MAX_BACKUP_TELEGRAM_BYTES = 45 * 1024 * 1024
 
@@ -829,6 +830,45 @@ async def admin_backup_upload_invalid(message: Message) -> None:
     await message.answer("Пришлите файл резервной копии как документ или отправьте /cancel для отмены.")
 
 
+@router.callback_query(F.data == "admin:retention:preview")
+async def admin_retention_preview(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    count = await DB.count_old_closed_leads(LEAD_RETENTION_DAYS)
+    await callback.message.edit_text(
+        "🧹 <b>Очистка старых заявок</b>\n\n"
+        f"Срок хранения закрытых заявок: <b>{LEAD_RETENTION_DAYS} дней</b>.\n"
+        f"Сейчас подходят под удаление: <b>{count}</b>.\n\n"
+        "Удаляются только заявки со статусом «Выполнена» или «Отменена», созданные раньше срока хранения. "
+        "Новые заявки и заявки «В работе» не затрагиваются. Удаление из активной базы необратимо; "
+        "копии в уже созданных резервных файлах останутся до удаления этих файлов.",
+        reply_markup=retention_confirm_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:retention:confirm")
+async def admin_retention_confirm(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await callback.answer("Удаляю старые закрытые заявки…")
+    try:
+        result = await DB.delete_old_closed_leads(LEAD_RETENTION_DAYS)
+    except Exception:
+        log.exception("Не удалось удалить старые закрытые заявки")
+        await callback.message.answer("❌ Очистка не выполнена. Проверьте журнал приложения.")
+        return
+    log.info("Privacy retention cleanup deleted %d closed leads older than %s", result["deleted"], result["cutoff"])
+    await callback.message.edit_text(
+        "✅ <b>Очистка завершена</b>\n\n"
+        f"Удалено заявок: <b>{result['deleted']}</b>\n"
+        f"Срок хранения: {LEAD_RETENTION_DAYS} дней.\n"
+        f"Дата отсечения: <code>{escape_text(result['cutoff'])} UTC</code>\n\n"
+        "Новые заявки и заявки «В работе» сохранены. Удалённые данные могут оставаться в старых резервных копиях.",
+        reply_markup=await admin_menu_keyboard(),
+    )
+
+
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery) -> None:
     if not await require_admin_callback(callback):
@@ -961,8 +1001,21 @@ async def periodic_backup_worker() -> None:
             log.exception("Не удалось создать плановую резервную копию")
 
 
+async def periodic_retention_worker() -> None:
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            result = await DB.delete_old_closed_leads(LEAD_RETENTION_DAYS)
+            if result["deleted"]:
+                log.info("Automatic retention cleanup deleted %d closed leads older than %s", result["deleted"], result["cutoff"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Не удалось автоматически удалить старые закрытые заявки")
+
+
 async def main() -> None:
-    global DB, ADMIN_IDS, BACKUP_INTERVAL_HOURS
+    global DB, ADMIN_IDS, BACKUP_INTERVAL_HOURS, LEAD_RETENTION_DAYS
     token = get_bot_token()
     ADMIN_IDS = get_admin_ids()
     if not token:
@@ -972,8 +1025,15 @@ async def main() -> None:
 
     database_path = get_database_path()
     BACKUP_INTERVAL_HOURS = get_backup_interval_hours()
+    LEAD_RETENTION_DAYS = get_lead_retention_days()
     DB = Database(database_path, get_backup_directory(), get_backup_retention())
     await DB.initialize(load_defaults())
+    try:
+        cleanup = await DB.delete_old_closed_leads(LEAD_RETENTION_DAYS)
+        if cleanup["deleted"]:
+            log.info("Startup retention cleanup deleted %d closed leads older than %s", cleanup["deleted"], cleanup["cutoff"])
+    except Exception:
+        log.exception("Не удалось выполнить стартовую очистку старых закрытых заявок; бот продолжит работу")
     try:
         initial_backup = await DB.create_backup()
         log.info("Создана стартовая резервная копия %s", initial_backup['filename'])
@@ -983,19 +1043,22 @@ async def main() -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     log.info(
-        "Бот запускается; администраторов: %d; SQLite: %s; backups: %s; retention: %d; interval: %dh",
-        len(ADMIN_IDS), database_path, DB.backup_dir, DB.backup_retention, BACKUP_INTERVAL_HOURS,
+        "Бот запускается; администраторов: %d; SQLite: %s; backups: %s; backup retention: %d; backup interval: %dh; lead retention: %dd",
+        len(ADMIN_IDS), database_path, DB.backup_dir, DB.backup_retention, BACKUP_INTERVAL_HOURS, LEAD_RETENTION_DAYS,
     )
     backup_task = asyncio.create_task(periodic_backup_worker(), name="sbor-periodic-backup")
+    retention_task = asyncio.create_task(periodic_retention_worker(), name="sbor-periodic-retention")
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         backup_task.cancel()
-        try:
-            await backup_task
-        except asyncio.CancelledError:
-            pass
+        retention_task.cancel()
+        for task in (backup_task, retention_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
 
 
