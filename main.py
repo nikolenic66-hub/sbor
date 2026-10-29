@@ -1053,17 +1053,21 @@ async def main() -> None:
     LEAD_RETENTION_DAYS = get_lead_retention_days()
     DB = Database(database_path, get_backup_directory(), get_backup_retention())
     await DB.initialize(load_defaults())
+    # Take the normal startup snapshot before any retention policy can delete records.
+    try:
+        initial_backup = await DB.create_backup()
+        log.info("Создана стартовая резервная копия %s", initial_backup["filename"])
+    except Exception:
+        log.exception("Не удалось создать стартовую резервную копию; бот продолжит работу")
     try:
         cleanup = await DB.delete_old_closed_leads(LEAD_RETENTION_DAYS)
         if cleanup["deleted"]:
-            log.info("Startup retention cleanup deleted %d closed leads older than %s", cleanup["deleted"], cleanup["cutoff"])
+            log.info(
+                "Startup retention cleanup deleted %d old closed leads (pre-delete backup: %s)",
+                cleanup["deleted"], cleanup.get("backup_before_delete") or "not needed",
+            )
     except Exception:
         log.exception("Не удалось выполнить стартовую очистку старых закрытых заявок; бот продолжит работу")
-    try:
-        initial_backup = await DB.create_backup()
-        log.info("Создана стартовая резервная копия %s", initial_backup['filename'])
-    except Exception:
-        log.exception("Не удалось создать стартовую резервную копию; бот продолжит работу")
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
