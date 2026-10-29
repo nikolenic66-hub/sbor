@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from main import escape_text
-from safety import is_private_admin, safe_csv_cell
+from safety import is_private_admin, is_private_chat, safe_csv_cell
 
 
 class SafetyTests(unittest.TestCase):
@@ -20,6 +20,14 @@ class SafetyTests(unittest.TestCase):
     def test_non_string_values_are_not_changed(self) -> None:
         self.assertEqual(safe_csv_cell(123), 123)
         self.assertIsNone(safe_csv_cell(None))
+
+    def test_intake_requires_private_chat(self) -> None:
+        self.assertTrue(is_private_chat("private"))
+        self.assertFalse(is_private_chat("group"))
+        self.assertFalse(is_private_chat("supergroup"))
+        class ChatType:
+            value = "private"
+        self.assertTrue(is_private_chat(ChatType()))
 
     def test_admin_access_requires_configured_id_and_private_chat(self) -> None:
         admins = {123, 456}
