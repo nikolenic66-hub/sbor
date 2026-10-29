@@ -18,7 +18,12 @@ def safe_csv_cell(value: Any) -> Any:
     return value
 
 
+def is_private_chat(chat_type: Any) -> bool:
+    """Return whether Telegram identifies the chat as a private conversation."""
+    chat_value = getattr(chat_type, "value", chat_type)
+    return str(chat_value) == "private"
+
+
 def is_private_admin(user_id: int | None, chat_type: Any, admin_ids: set[int]) -> bool:
     """Access policy for admin actions: configured user, private bot chat only."""
-    chat_value = getattr(chat_type, "value", chat_type)
-    return user_id is not None and user_id in admin_ids and str(chat_value) == "private"
+    return user_id is not None and user_id in admin_ids and is_private_chat(chat_type)
